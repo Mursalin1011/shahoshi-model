@@ -138,12 +138,12 @@ def compare(report_dir: str | Path, keys: list[str] | None = None) -> str:
         keys = seen
 
     width = max((len(r["name"]) for r in runs), default=4)
-    lines = ["  ".join([f"{'run':<{width}}", *(f"{k:>18s}" for k in keys)])]
+    lines = ["  ".join([f"{'run':<{width}}", *(f"{k:>21s}" for k in keys)])]
     for r in runs:
         cells = []
         for k in keys:
             v = r.get("metrics", {}).get(k)
-            cells.append(f"{v:>18.4f}" if isinstance(v, (int, float)) else f"{'-':>18s}")
+            cells.append(f"{v:>21.4f}" if isinstance(v, (int, float)) else f"{'-':>21s}")
         lines.append("  ".join([f"{r['name']:<{width}}", *cells]))
     return "\n".join(lines)
 
