@@ -63,12 +63,23 @@ def to_int8(
     model: tf.keras.Model,
     rep_x: np.ndarray,
     path: str | Path | None = None,
+    output_int8: bool = True,
 ) -> bytes:
     """Convert a Keras model to a fully int8-quantized TFLite blob.
 
     Falls back to the SavedModel route when `from_keras_model` refuses, which
     Keras 3 (TF >= 2.16) frequently does. The SavedModel path is the supported
     route and produces an identical graph, so the fallback is not a compromise.
+
+    Parameters
+    ----------
+    output_int8 : bool
+        Quantize the *outputs* to int8 as well as the weights and activations.
+        Turning this off leaves a trailing DEQUANTIZE so outputs come back as
+        float32, while every kernel stays integer. That matters more than it
+        sounds: an int8 softmax output carries about 1/256 of resolution, and
+        when two classes are close the argmax can flip on a rounding boundary.
+        `diagnose` measures whether that is happening here.
     """
     rep_x = np.asarray(rep_x, dtype=np.float32)
 
@@ -76,7 +87,7 @@ def to_int8(
         conv.optimizations = [tf.lite.Optimize.DEFAULT]
         conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         conv.inference_input_type = tf.int8
-        conv.inference_output_type = tf.int8
+        conv.inference_output_type = tf.int8 if output_int8 else tf.float32
         conv.representative_dataset = lambda: ([rep_x[i : i + 1]] for i in range(len(rep_x)))
         return conv.convert()
 
@@ -245,3 +256,157 @@ def accuracy_delta(
         "delta": float((pq == y).mean() - (pf == y).mean()),
         "agreement": float((pf == pq).mean()),
     }
+
+
+# ---------------------------------------------------------------------------
+# diagnosing an int8 accuracy drop
+# ---------------------------------------------------------------------------
+
+def diagnose(
+    model: tf.keras.Model,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    n_classes: int,
+    embed_dim: int,
+    float_probs: np.ndarray,
+    rep_sizes: tuple[int, ...] = (256, 512, 1024, 2048),
+    seed: int = 42,
+) -> dict:
+    """Locate the cause of an int8 accuracy drop by measurement, not guesswork.
+
+    A post-training int8 conversion of a depthwise-separable network should cost
+    0-2 accuracy points. A larger drop has three plausible causes, and they call
+    for different fixes, so guessing is expensive:
+
+    1. **Calibration** -- the representative set does not cover the activation
+       ranges the test data produces, so activations clip. Fix: more and more
+       diverse representative windows. Detected by the drop shrinking as
+       `rep_sizes` grows.
+    2. **Output resolution** -- an int8 softmax has ~1/256 resolution, so the
+       argmax flips whenever the top two classes are within one quantization
+       step. Fix: float32 outputs, which keeps every kernel integer. Detected by
+       the float-output variant recovering most of the gap.
+    3. **Weight quantization** -- per-channel weight ranges in the depthwise
+       layers are too wide for int8 to represent. Fix: quantization-aware
+       training, or architectural changes. Indicated when neither of the above
+       moves the number.
+
+    Returns
+    -------
+    dict with a `sweep` list (one entry per representative-set size), a
+    `float_output` entry, `per_class` recall deltas, and a `verdict` string.
+    """
+    float_pred = np.asarray(float_probs).argmax(1)
+    float_acc = float((float_pred == y_test).mean())
+    out: dict = {"float_accuracy": float_acc, "sweep": [], "per_class": {}}
+
+    print(f"float32 accuracy: {float_acc:.4f}\n")
+    print("1. calibration -- does a bigger representative set help?")
+    print(f"   {'rep windows':>12s} {'int8 acc':>10s} {'delta':>9s} {'agreement':>10s}")
+
+    best = None
+    for n in rep_sizes:
+        if n > len(X_train):
+            continue
+        rep = representative_dataset(X_train, y_train, n=n, n_classes=n_classes, seed=seed)
+        blob = to_int8(model, rep)
+        probs = predict_named(blob, X_test, n_classes, embed_dim)["probs"]
+        pred = probs.argmax(1)
+        row = {
+            "rep_size": int(len(rep)),
+            "accuracy": float((pred == y_test).mean()),
+            "delta": float((pred == y_test).mean() - float_acc),
+            "agreement": float((pred == float_pred).mean()),
+            "blob": blob,
+        }
+        out["sweep"].append(row)
+        print(f"   {row['rep_size']:>12,} {row['accuracy']:>10.4f} "
+              f"{row['delta']:>+9.4f} {row['agreement']:>10.4f}")
+        if best is None or row["accuracy"] > best["accuracy"]:
+            best = row
+
+    print("\n2. output resolution -- do float32 outputs recover the gap?")
+    rep = representative_dataset(X_train, y_train, n=max(rep_sizes),
+                                 n_classes=n_classes, seed=seed)
+    blob_f = to_int8(model, rep, output_int8=False)
+    probs_fo = predict_named(blob_f, X_test, n_classes, embed_dim)["probs"]
+    pred_fo = probs_fo.argmax(1)
+    out["float_output"] = {
+        "accuracy": float((pred_fo == y_test).mean()),
+        "delta": float((pred_fo == y_test).mean() - float_acc),
+        "agreement": float((pred_fo == float_pred).mean()),
+        "blob": blob_f,
+    }
+    print(f"   int8 weights + float32 outputs: {out['float_output']['accuracy']:.4f} "
+          f"({out['float_output']['delta']:+.4f})")
+
+    # Where the loss lands, per class. Diffuse loss points at weights; loss
+    # concentrated in one class points at that class sitting near a boundary.
+    print("\n3. per-class recall, float vs best int8")
+    ref = best if best is not None else out["float_output"]
+    best_pred = (predict_named(ref["blob"], X_test, n_classes, embed_dim)["probs"].argmax(1)
+                 if "blob" in ref else pred_fo)
+    for c in range(n_classes):
+        msk = np.asarray(y_test) == c
+        if not msk.any():
+            continue
+        rf = float((float_pred[msk] == c).mean())
+        rq = float((best_pred[msk] == c).mean())
+        out["per_class"][int(c)] = {"float": rf, "int8": rq, "delta": rq - rf}
+        print(f"   class {c}: float {rf:.3f}  int8 {rq:.3f}  ({rq - rf:+.3f})  n={int(msk.sum())}")
+
+    # Verdict, in the order the fixes should be tried.
+    sweep_gain = (out["sweep"][-1]["accuracy"] - out["sweep"][0]["accuracy"]
+                  if len(out["sweep"]) > 1 else 0.0)
+    fo_gain = out["float_output"]["accuracy"] - (best["accuracy"] if best else 0.0)
+
+    if out["float_output"]["delta"] > -0.02:
+        verdict = ("output resolution. int8 weights with float32 outputs is within 2 "
+                   "points, so the kernels are fine and the int8 softmax was losing "
+                   "the argmax. Ship output_int8=False -- every kernel stays integer "
+                   "and only a trailing DEQUANTIZE is added.")
+    elif sweep_gain > 0.02:
+        verdict = ("calibration. The drop shrinks as the representative set grows, so "
+                   "raise quantize.n_representative and re-measure before anything else.")
+    elif fo_gain > 0.02:
+        verdict = ("mostly output resolution, with some calibration loss left over. "
+                   "Use float32 outputs and the largest representative set.")
+    else:
+        verdict = ("weight quantization. Neither calibration nor output dtype moves it, "
+                   "so the depthwise per-channel weight ranges are the problem. That "
+                   "needs quantization-aware training or an architecture change -- not "
+                   "more calibration data.")
+    out["verdict"] = verdict
+    print(f"\nverdict: {verdict}")
+    return out
+
+
+def set_determinism(seed: int = 42) -> None:
+    """Make a training run reproducible, including on GPU.
+
+    `tf.random.set_seed` alone does not do this: cuDNN picks nondeterministic
+    kernels for convolution backprop, so two runs of identical code diverge. In
+    this project that showed up as held-out accuracy of 0.9024 and 0.8758 from
+    the same commit -- a 2.7-point spread that could easily be mistaken for a
+    real effect when comparing two experiments.
+
+    Costs some training speed. Worth it: without it, no ablation in this project
+    is interpretable.
+    """
+    import os
+    import random
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TF_DETERMINISTIC_OPS"] = "1"
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+    try:
+        tf.config.experimental.enable_op_determinism()
+        print(f"  op determinism enabled, seed {seed}")
+    except Exception as exc:  # noqa: BLE001 - availability varies by TF build
+        print(f"  op determinism unavailable ({type(exc).__name__}: {exc}); "
+              f"seeds set, but GPU runs may still vary")

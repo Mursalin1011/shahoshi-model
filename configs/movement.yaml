@@ -42,10 +42,12 @@ train:
   patience: 20
   monitor: val_macro_f1
   class_weighted: true
+  deterministic: true
   seed: 42
 
 quantize:
-  n_representative: 512
+  n_representative: 2048
+  output_int8: true
   seed: 42
 
 scoring:

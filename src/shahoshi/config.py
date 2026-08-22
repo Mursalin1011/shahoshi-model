@@ -70,6 +70,9 @@ class TrainConfig:
     patience: int = 20
     monitor: str = "val_macro_f1"
     class_weighted: bool = True
+    # tf.random.set_seed alone leaves cuDNN free to pick nondeterministic
+    # convolution kernels; two runs of identical code gave 0.9024 and 0.8758.
+    deterministic: bool = True
     fall_positive_weight: float = 1.0
     seed: int = 42
 
@@ -77,6 +80,11 @@ class TrainConfig:
 @dataclass
 class QuantizeConfig:
     n_representative: int = 512
+    # int8 outputs as well as int8 kernels. Turning this off leaves a trailing
+    # DEQUANTIZE and float32 outputs while every kernel stays integer -- see
+    # quantize.to_int8. An int8 softmax has ~1/256 resolution, so the argmax
+    # can flip whenever the top two classes are within one step.
+    output_int8: bool = True
     seed: int = 42
 
 
