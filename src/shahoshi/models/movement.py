@@ -34,7 +34,22 @@ from ..datasets.base import N_CHANNELS, N_CLASSES
 WIN = 128
 
 
-def _ds_block(x, filters: int, kernel: int, name: str):
+def _relu(name: str, bounded: bool):
+    """ReLU, optionally capped at 6.
+
+    An unbounded ReLU is fine in float and expensive in int8. TFLite sizes
+    each activation scale from the min/max observed during calibration, so a
+    long tail spends the int8 range on outliers and squeezes the bulk of the
+    distribution into a handful of the 127 levels. Capping at 6 is what
+    MobileNet does, for exactly this reason.
+
+    Use quantize.activation_ranges() to see whether it is needed here rather
+    than assuming: the column to read is levels_at_p99.
+    """
+    return L.ReLU(max_value=6.0, name=name) if bounded else L.ReLU(name=name)
+
+
+def _ds_block(x, filters: int, kernel: int, name: str, bounded: bool = False):
     """Depthwise-separable convolution: depthwise, pointwise, BN and ReLU on each.
 
     BatchNorm folds into the preceding convolution at conversion time and costs
@@ -42,10 +57,10 @@ def _ds_block(x, filters: int, kernel: int, name: str):
     """
     x = L.DepthwiseConv1D(kernel, padding="same", use_bias=False, name=f"{name}_dw")(x)
     x = L.BatchNormalization(name=f"{name}_bn1")(x)
-    x = L.ReLU(name=f"{name}_r1")(x)
+    x = _relu(f"{name}_r1", bounded)(x)
     x = L.Conv1D(filters, 1, use_bias=False, name=f"{name}_pw")(x)
     x = L.BatchNormalization(name=f"{name}_bn2")(x)
-    x = L.ReLU(name=f"{name}_r2")(x)
+    x = _relu(f"{name}_r2", bounded)(x)
     return x
 
 
@@ -57,6 +72,7 @@ def build(
     width: float = 1.0,
     dropout: float = 0.3,
     with_fall_head: bool = False,
+    bounded_relu: bool = False,
 ) -> tuple[tf.keras.Model, tf.keras.Model]:
     """Build the movement model, as a training view and an export view.
 
@@ -87,18 +103,21 @@ def build(
 
     x = L.Conv1D(w(24), 9, strides=2, padding="same", use_bias=False, name="stem")(inp)
     x = L.BatchNormalization(name="stem_bn")(x)
-    x = L.ReLU(name="stem_relu")(x)                       # 64 x 24
+    x = _relu("stem_relu", bounded_relu)(x)               # 64 x 24
 
-    x = _ds_block(x, w(32), 5, "b1")
+    x = _ds_block(x, w(32), 5, "b1", bounded_relu)
     x = L.MaxPooling1D(2, name="p1")(x)                    # 32 x 32
-    x = _ds_block(x, w(48), 5, "b2")
+    x = _ds_block(x, w(48), 5, "b2", bounded_relu)
     x = L.MaxPooling1D(2, name="p2")(x)                    # 16 x 48
-    x = _ds_block(x, w(64), 5, "b3")
+    x = _ds_block(x, w(64), 5, "b3", bounded_relu)
     x = L.MaxPooling1D(2, name="p3")(x)                    #  8 x 64
-    x = _ds_block(x, w(64), 3, "b4")                       #  8 x 64
+    x = _ds_block(x, w(64), 3, "b4", bounded_relu)                       #  8 x 64
 
     x = L.GlobalAveragePooling1D(name="gap")(x)
-    emb = L.Dense(embed_dim, activation="relu", name="embedding")(x)
+    # The embedding is also int8-quantized on export and feeds the Mahalanobis
+    # scorer, so its activation range matters for the same reason.
+    emb = L.Dense(embed_dim, name="embedding_dense")(x)
+    emb = _relu("embedding", bounded_relu)(emb)
 
     dropped = L.Dropout(dropout, name="drop")(emb)
     probs = L.Dense(n_classes, activation="softmax", name="probs")(dropped)

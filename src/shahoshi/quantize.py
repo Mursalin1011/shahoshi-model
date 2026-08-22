@@ -410,3 +410,77 @@ def set_determinism(seed: int = 42) -> None:
     except Exception as exc:  # noqa: BLE001 - availability varies by TF build
         print(f"  op determinism unavailable ({type(exc).__name__}: {exc}); "
               f"seeds set, but GPU runs may still vary")
+
+
+def activation_ranges(
+    model: tf.keras.Model,
+    X: np.ndarray,
+    sample: int = 1024,
+    seed: int = 42,
+) -> list[dict]:
+    """Per-layer activation percentiles, to expose outlier tails.
+
+    TFLite calibrates activation scales from the min and max seen over the
+    representative set. So a layer whose values mostly live in [0, 2] but which
+    occasionally spikes to 40 gets a scale sized for 40, and the ordinary values
+    are then squeezed into the bottom 5% of the int8 range -- roughly 6 of the
+    available 127 levels. That is how a conversion loses 8-12 accuracy points
+    while every individual op is behaving correctly.
+
+    It also explains a counter-intuitive observation: enlarging the
+    representative set made this model's int8 accuracy *worse* (-0.081 at 512
+    windows, -0.123 at 2048). More samples means more opportunities to observe an
+    extreme value, a wider calibrated range, and coarser quantization for
+    everything else. Under this failure mode, more calibration data actively
+    hurts.
+
+    The column to read is `levels_at_p99`: how many of the 127 int8 levels the
+    bulk of the distribution actually occupies. Single digits is a problem.
+    Unbounded ReLU is the usual cause, and a bounded activation
+    (`model.bounded_relu`) is the usual fix.
+    """
+    acts = [
+        layer for layer in model.layers
+        if isinstance(layer, tf.keras.layers.ReLU)
+        or layer.__class__.__name__ in ("Activation", "Dense")
+    ]
+    if not acts:
+        raise ValueError("no activation layers found to probe")
+
+    rng = np.random.default_rng(seed)
+    X = np.asarray(X, dtype=np.float32)
+    idx = rng.choice(len(X), min(sample, len(X)), replace=False)
+
+    probe = tf.keras.Model(model.inputs, [layer.output for layer in acts])
+    outs = probe.predict(X[idx], batch_size=128, verbose=0)
+    if not isinstance(outs, list):
+        outs = [outs]
+
+    rows = []
+    print(f"{'layer':<18s} {'p50':>9s} {'p99':>9s} {'p99.9':>9s} {'max':>9s} "
+          f"{'max/p99.9':>10s} {'levels_at_p99':>14s}")
+    for layer, out in zip(acts, outs):
+        v = np.abs(np.asarray(out, dtype=np.float64)).ravel()
+        p50, p99, p999 = (float(np.percentile(v, q)) for q in (50, 99, 99.9))
+        mx = float(v.max())
+        ratio = mx / max(p999, 1e-12)
+        levels = 127.0 * p99 / max(mx, 1e-12)
+        rows.append({
+            "layer": layer.name, "p50": p50, "p99": p99, "p99_9": p999,
+            "max": mx, "max_over_p999": ratio, "levels_at_p99": levels,
+        })
+        flag = "  <-- outlier tail" if levels < 16 else ""
+        print(f"{layer.name:<18s} {p50:>9.3f} {p99:>9.3f} {p999:>9.3f} {mx:>9.3f} "
+              f"{ratio:>10.2f} {levels:>14.1f}{flag}")
+
+    worst = min(rows, key=lambda r: r["levels_at_p99"])
+    print(f"\nworst layer: {worst['layer']} -- the bulk of its distribution occupies "
+          f"{worst['levels_at_p99']:.1f} of 127 int8 levels")
+    if worst["levels_at_p99"] < 16:
+        print("This is enough to explain a large int8 drop on its own. Set\n"
+              "model.bounded_relu: true to cap activations at 6 and retrain; that is\n"
+              "standard practice for int8 targets and costs little float accuracy.")
+    else:
+        print("No severe outlier tail here, so look at weight quantization instead "
+              "(quantize.diagnose reports which).")
+    return rows

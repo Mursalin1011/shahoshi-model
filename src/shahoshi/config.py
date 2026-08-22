@@ -60,6 +60,10 @@ class ModelConfig:
     width: float = 1.0
     dropout: float = 0.3
     with_fall_head: bool = False
+    # Cap activations at 6. Unbounded ReLU is free in float and expensive in
+    # int8: TFLite sizes activation scales from observed min/max, so a long
+    # tail spends the range on outliers. See quantize.activation_ranges.
+    bounded_relu: bool = False
 
 
 @dataclass

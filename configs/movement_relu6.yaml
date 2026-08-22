@@ -5,10 +5,11 @@
 # (float32 0.8111 / int8 0.7834 held-out accuracy, macro-F1 0.75) except that
 # the `lay` class is gone.
 
-name: movement-baseline
+name: movement-relu6
 notes: >
-  Six classes (lay dropped), no dilated convolutions, single dual-output model,
-  class weighting inside the loss, early stopping on val macro-F1.
+  Baseline with activations capped at 6. Compare int8_delta against
+  movement-baseline: unbounded ReLU lets a long activation tail set the
+  quantization scale, which spends the int8 range on outliers.
 
 out_dir: artifacts
 report_dir: reports
@@ -33,7 +34,7 @@ model:
   embed_dim: 64
   width: 1.0
   dropout: 0.3
-  bounded_relu: false
+  bounded_relu: true
   with_fall_head: false   # no fall-labelled corpus loaded yet
 
 train:
