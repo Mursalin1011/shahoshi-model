@@ -18,6 +18,8 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from .heads import assign_roles
+
 
 def representative_dataset(
     X: np.ndarray,
@@ -103,17 +105,25 @@ def interpreter(blob: bytes) -> tf.lite.Interpreter:
     return itp
 
 
-def output_index(blob: bytes) -> dict[str, int]:
-    """Map output tensor name fragments to their position in the output list.
+def output_roles(
+    blob: bytes,
+    n_classes: int,
+    embed_dim: int,
+    with_fall_head: bool = False,
+) -> dict[str, int]:
+    """Resolve the converted model's outputs to roles, verified by width."""
+    details = interpreter(blob).get_output_details()
+    widths = [int(d["shape"][-1]) for d in details]
+    return assign_roles(widths, n_classes, embed_dim, with_fall_head)
 
-    TFLite does not preserve Keras output names reliably across versions, so
-    resolve positionally but *verify* by shape: the activity head is the one
-    whose width equals the class count, the embedding is the wide one. Guessing
-    silently would mean scoring Mahalanobis on a softmax.
+
+def output_widths(blob: bytes) -> list[int]:
+    """Last-dimension size of each output, in the converter's order.
+
+    Worth printing after every conversion: it is the fact that reveals whether
+    the converter reordered the heads.
     """
-    itp = interpreter(blob)
-    details = itp.get_output_details()
-    return {d["name"]: i for i, d in enumerate(details)}
+    return [int(d["shape"][-1]) for d in interpreter(blob).get_output_details()]
 
 
 def predict(blob: bytes, X: np.ndarray, batch_note: bool = False) -> list[np.ndarray]:
@@ -154,6 +164,24 @@ def predict(blob: bytes, X: np.ndarray, batch_note: bool = False) -> list[np.nda
             print(f"    {i:,}/{len(X):,}")
 
     return [np.array(c) for c in collected]
+
+
+def predict_named(
+    blob: bytes,
+    X: np.ndarray,
+    n_classes: int,
+    embed_dim: int,
+    with_fall_head: bool = False,
+    batch_note: bool = False,
+) -> dict[str, np.ndarray]:
+    """Run the int8 model and return outputs keyed by role, resolved by width.
+
+    Prefer this over `predict` everywhere. `predict` returns the converter's
+    positional order, which is not the order the Keras model declared.
+    """
+    roles = output_roles(blob, n_classes, embed_dim, with_fall_head)
+    outs = predict(blob, X, batch_note=batch_note)
+    return {role: outs[idx] for role, idx in roles.items()}
 
 
 def ops_used(blob: bytes) -> list[str]:
