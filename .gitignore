@@ -1,0 +1,34 @@
+# --- data (never committed; multi-GB) ---
+data/
+*.zip
+*.npz
+UCI HAR Dataset/
+A_DeviceMotion_data/
+SisFall_dataset/
+
+# --- build artifacts ---
+artifacts/
+reports/
+*.tflite
+movement_model_data.cc
+movement_model_data.h
+embedding_model_data.cc
+embedding_model_data.h
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- editor / os ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
