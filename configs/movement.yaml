@@ -1,0 +1,54 @@
+# Stage 0 baseline: the pre-refactor experiment, with the four defects fixed.
+#
+# Re-run this first. Its numbers are the comparison point for everything that
+# follows, and they are directly comparable to the pre-refactor baseline
+# (float32 0.8111 / int8 0.7834 held-out accuracy, macro-F1 0.75) except that
+# the `lay` class is gone.
+
+name: movement-baseline
+notes: >
+  Six classes (lay dropped), no dilated convolutions, single dual-output model,
+  class weighting inside the loss, early stopping on val macro-F1.
+
+out_dir: artifacts
+report_dir: reports
+
+data:
+  root: data
+  datasets: [uci, ms]
+  win: 128        # 2.56 s at 50 Hz, matching UCI HAR's native windowing
+  stride: 64      # 50% overlap -> a 1.28 s inference hop on device
+  fs: 50
+  download: true
+
+split:
+  protocol: subject
+  seed: 42
+  fracs: [0.70, 0.15, 0.15]
+
+augment:
+  times: 0        # off for the baseline; the ablation turns it on
+
+model:
+  embed_dim: 64
+  width: 1.0
+  dropout: 0.3
+  with_fall_head: false   # no fall-labelled corpus loaded yet
+
+train:
+  epochs: 120
+  batch_size: 64
+  lr: 0.001
+  patience: 20
+  monitor: val_macro_f1
+  class_weighted: true
+  seed: 42
+
+quantize:
+  n_representative: 512
+  seed: 42
+
+scoring:
+  shrinkage: 0.001
+  target_fars: [0.5, 1.0, 2.0, 6.0]
+  export_far: 1.0
