@@ -59,6 +59,26 @@ def representative_dataset(
     return X[idx[:n]]
 
 
+def _convert(model: tf.keras.Model, configure) -> bytes:
+    """Run `configure` against a converter, falling back to the SavedModel route.
+
+    Keras 3 (TF >= 2.16) frequently refuses `from_keras_model`. Exporting a
+    SavedModel first is the supported route and produces an identical graph, so
+    the fallback is not a compromise. Shared by every conversion variant.
+    """
+    try:
+        return configure(tf.lite.TFLiteConverter.from_keras_model(model))
+    except Exception as exc:  # noqa: BLE001 - the converter raises many types
+        print(f"  from_keras_model failed ({type(exc).__name__}), using SavedModel route")
+        import shutil
+        import tempfile
+
+        sm = Path(tempfile.gettempdir()) / f"sm_{model.name}"
+        shutil.rmtree(sm, ignore_errors=True)
+        model.export(str(sm))
+        return configure(tf.lite.TFLiteConverter.from_saved_model(str(sm)))
+
+
 def to_int8(
     model: tf.keras.Model,
     rep_x: np.ndarray,
@@ -91,17 +111,7 @@ def to_int8(
         conv.representative_dataset = lambda: ([rep_x[i : i + 1]] for i in range(len(rep_x)))
         return conv.convert()
 
-    try:
-        blob = configure(tf.lite.TFLiteConverter.from_keras_model(model))
-    except Exception as exc:  # noqa: BLE001 - the converter raises many types
-        print(f"  from_keras_model failed ({type(exc).__name__}), using SavedModel route")
-        import shutil
-        import tempfile
-
-        sm = Path(tempfile.gettempdir()) / f"sm_{model.name}"
-        shutil.rmtree(sm, ignore_errors=True)
-        model.export(str(sm))
-        blob = configure(tf.lite.TFLiteConverter.from_saved_model(str(sm)))
+    blob = _convert(model, configure)
 
     if path is not None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +147,12 @@ def output_widths(blob: bytes) -> list[int]:
     return [int(d["shape"][-1]) for d in interpreter(blob).get_output_details()]
 
 
-def predict(blob: bytes, X: np.ndarray, batch_note: bool = False) -> list[np.ndarray]:
+def predict(
+    blob: bytes,
+    X: np.ndarray,
+    batch_note: bool = False,
+    require_int8: bool = True,
+) -> list[np.ndarray]:
     """Run the int8 model over `X`, returning dequantized float outputs.
 
     Quantizes the input and dequantizes each output using the scale and
@@ -154,17 +169,22 @@ def predict(blob: bytes, X: np.ndarray, batch_note: bool = False) -> list[np.nda
     out_d = itp.get_output_details()
 
     si, zi = in_d["quantization"]
-    if si == 0:
+    int8_in = np.issubdtype(in_d["dtype"], np.integer)
+    if require_int8 and (si == 0 or not int8_in):
         raise ValueError(
             "input tensor is not quantized -- to_int8() did not produce a "
-            "fully-integer model, so the firmware would need float kernels"
+            "fully-integer model, so the firmware would need float kernels. "
+            "Pass require_int8=False if this is a diagnostic variant."
         )
 
     X = np.asarray(X, dtype=np.float32)
     collected: list[list[np.ndarray]] = [[] for _ in out_d]
 
     for i, x in enumerate(X):
-        q = np.clip(np.round(x / si + zi), -128, 127).astype(np.int8)
+        if int8_in:
+            q = np.clip(np.round(x / si + zi), -128, 127).astype(np.int8)
+        else:
+            q = x.astype(in_d["dtype"])
         itp.set_tensor(in_d["index"], q[None])
         itp.invoke()
         for k, d in enumerate(out_d):
@@ -184,6 +204,7 @@ def predict_named(
     embed_dim: int,
     with_fall_head: bool = False,
     batch_note: bool = False,
+    require_int8: bool = True,
 ) -> dict[str, np.ndarray]:
     """Run the int8 model and return outputs keyed by role, resolved by width.
 
@@ -191,7 +212,7 @@ def predict_named(
     positional order, which is not the order the Keras model declared.
     """
     roles = output_roles(blob, n_classes, embed_dim, with_fall_head)
-    outs = predict(blob, X, batch_note=batch_note)
+    outs = predict(blob, X, batch_note=batch_note, require_int8=require_int8)
     return {role: outs[idx] for role, idx in roles.items()}
 
 
@@ -469,18 +490,243 @@ def activation_ranges(
             "layer": layer.name, "p50": p50, "p99": p99, "p99_9": p999,
             "max": mx, "max_over_p999": ratio, "levels_at_p99": levels,
         })
-        flag = "  <-- outlier tail" if levels < 16 else ""
+        flag = "  <-- outlier tail" if levels < 32 else ""
         print(f"{layer.name:<18s} {p50:>9.3f} {p99:>9.3f} {p999:>9.3f} {mx:>9.3f} "
               f"{ratio:>10.2f} {levels:>14.1f}{flag}")
 
     worst = min(rows, key=lambda r: r["levels_at_p99"])
     print(f"\nworst layer: {worst['layer']} -- the bulk of its distribution occupies "
           f"{worst['levels_at_p99']:.1f} of 127 int8 levels")
-    if worst["levels_at_p99"] < 16:
+    if worst["levels_at_p99"] < 32:
         print("This is enough to explain a large int8 drop on its own. Set\n"
               "model.bounded_relu: true to cap activations at 6 and retrain; that is\n"
               "standard practice for int8 targets and costs little float accuracy.")
     else:
         print("No severe outlier tail here, so look at weight quantization instead "
               "(quantize.diagnose reports which).")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# separating weight quantization from activation quantization
+# ---------------------------------------------------------------------------
+
+def to_variant(
+    model: tf.keras.Model,
+    mode: str,
+    rep_x: np.ndarray | None = None,
+) -> bytes:
+    """Convert to one of several quantization variants, for attribution.
+
+    The variants exist because "int8 costs 12 points" is not actionable. Weights
+    and activations are quantized by different mechanisms, they fail for
+    different reasons, and they have different fixes -- bounded activations or a
+    different calibration for one, quantization-aware training for the other.
+    Comparing these variants attributes the loss instead of inferring it.
+
+    Modes
+    -----
+    ``full_int8``
+        int8 weights, int8 activations, int8 in/out. The deployment target.
+    ``int8_out_float``
+        int8 weights and activations, float32 in/out. Isolates output resolution.
+    ``dynamic_range``
+        **The discriminator.** int8 weights, but activations stay float32 at
+        runtime -- no representative dataset is used at all. If this holds
+        accuracy, the weights quantize fine and activation quantization is
+        responsible. If it drops as far as full int8, the weights are the problem.
+    ``float16``
+        16-bit weights, float activations. A near-lossless floor; if even this
+        drops, something is wrong beyond quantization.
+    """
+    modes = ("full_int8", "int8_out_float", "dynamic_range", "float16")
+    if mode not in modes:
+        raise ValueError(f"mode must be one of {modes}; got {mode!r}")
+    if mode in ("full_int8", "int8_out_float") and rep_x is None:
+        raise ValueError(f"mode {mode!r} needs a representative dataset")
+
+    def configure(conv: tf.lite.TFLiteConverter) -> bytes:
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        if mode == "float16":
+            conv.target_spec.supported_types = [tf.float16]
+        elif mode == "dynamic_range":
+            pass  # weights-only int8: no representative dataset, float activations
+        else:
+            conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+            conv.inference_input_type = tf.int8
+            conv.inference_output_type = tf.int8 if mode == "full_int8" else tf.float32
+            rep = np.asarray(rep_x, dtype=np.float32)
+            conv.representative_dataset = lambda: ([rep[i : i + 1]] for i in range(len(rep)))
+        return conv.convert()
+
+    return _convert(model, configure)
+
+
+def attribute_loss(
+    model: tf.keras.Model,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    n_classes: int,
+    embed_dim: int,
+    float_probs: np.ndarray,
+    n_representative: int = 512,
+    seed: int = 42,
+) -> dict:
+    """Attribute an int8 accuracy drop to weights or to activations.
+
+    Runs the variants in `to_variant` and reports each one's accuracy against the
+    float model. The comparison that matters is `dynamic_range` versus
+    `full_int8`: they use identically quantized weights and differ only in
+    whether activations are quantized, so the gap between them is the cost of
+    activation quantization and the gap from float to `dynamic_range` is the cost
+    of weight quantization.
+
+    This replaces a verdict reached by elimination. Ruling out calibration and
+    output dtype leaves weights *and* activations both in play, and prescribing
+    quantization-aware training for what turns out to be an activation-range
+    problem would be an expensive detour.
+    """
+    y_test = np.asarray(y_test)
+    float_pred = np.asarray(float_probs).argmax(1)
+    float_acc = float((float_pred == y_test).mean())
+
+    rep = representative_dataset(X_train, y_train, n=n_representative,
+                                 n_classes=n_classes, seed=seed)
+
+    results: dict[str, dict] = {}
+    plan = [
+        ("float16", None),
+        ("dynamic_range", None),
+        ("int8_out_float", rep),
+        ("full_int8", rep),
+    ]
+    print(f"float32 accuracy: {float_acc:.4f}\n")
+    print(f"{'variant':<16s} {'weights':<9s} {'activations':<12s} "
+          f"{'accuracy':>9s} {'delta':>9s} {'agreement':>10s}")
+
+    describe = {
+        "float16": ("float16", "float32"),
+        "dynamic_range": ("int8", "float32"),
+        "int8_out_float": ("int8", "int8"),
+        "full_int8": ("int8", "int8"),
+    }
+    for mode, r in plan:
+        try:
+            blob = to_variant(model, mode, r)
+            probs = predict_named(blob, X_test, n_classes, embed_dim,
+                                  require_int8=False)["probs"]
+        except Exception as exc:  # noqa: BLE001 - converter raises many types
+            print(f"{mode:<16s} failed: {type(exc).__name__}: {exc}")
+            continue
+        pred = probs.argmax(1)
+        acc = float((pred == y_test).mean())
+        results[mode] = {
+            "accuracy": acc,
+            "delta": acc - float_acc,
+            "agreement": float((pred == float_pred).mean()),
+            "size_kb": len(blob) / 1024,
+        }
+        w, a = describe[mode]
+        print(f"{mode:<16s} {w:<9s} {a:<12s} {acc:>9.4f} "
+              f"{acc - float_acc:>+9.4f} {results[mode]['agreement']:>10.4f}")
+
+    out: dict = {"float_accuracy": float_acc, "variants": results}
+
+    dr = results.get("dynamic_range")
+    fi = results.get("full_int8")
+    if dr is None or fi is None:
+        out["verdict"] = "inconclusive: a required variant failed to convert"
+        print(f"\nverdict: {out['verdict']}")
+        return out
+
+    weight_cost = float_acc - dr["accuracy"]        # float -> int8 weights
+    activation_cost = dr["accuracy"] - fi["accuracy"]  # + int8 activations
+    out["weight_cost"] = weight_cost
+    out["activation_cost"] = activation_cost
+
+    print(f"\ncost of quantizing weights     : {weight_cost:+.4f}")
+    print(f"cost of quantizing activations : {activation_cost:+.4f}")
+
+    if activation_cost > 2 * max(weight_cost, 1e-6) and activation_cost > 0.02:
+        out["verdict"] = (
+            f"activation quantization, not weights. int8 weights alone cost "
+            f"{weight_cost:.4f} while adding int8 activations costs "
+            f"{activation_cost:.4f}. Fix the activation ranges -- set "
+            f"model.bounded_relu: true and retrain -- rather than reaching for "
+            f"quantization-aware training."
+        )
+    elif weight_cost > 2 * max(activation_cost, 1e-6) and weight_cost > 0.02:
+        out["verdict"] = (
+            f"weight quantization. int8 weights alone already cost "
+            f"{weight_cost:.4f}, so calibration and activation ranges are not the "
+            f"lever. This needs quantization-aware training, a wider model, or "
+            f"accepting the loss."
+        )
+    elif weight_cost + activation_cost <= 0.02:
+        out["verdict"] = "no meaningful int8 loss to attribute"
+    else:
+        out["verdict"] = (
+            f"both, comparably: weights {weight_cost:.4f}, activations "
+            f"{activation_cost:.4f}. Try bounded activations first since it is "
+            f"far cheaper, then quantization-aware training if the remainder "
+            f"still matters."
+        )
+    print(f"\nverdict: {out['verdict']}")
+    return out
+
+
+def weight_ranges(model: tf.keras.Model) -> list[dict]:
+    """Per-output-channel weight range spread for each convolution.
+
+    TFLite quantizes convolution weights per output channel, so wide variation
+    *between* channels is handled. What it cannot handle is a wide range *within*
+    one channel. This reports both, so a claim about "depthwise per-channel
+    weight ranges" can be checked rather than asserted.
+
+    Note these are the pre-fold weights. BatchNorm folds a per-channel
+    gamma/sqrt(var+eps) multiplier into the preceding convolution at conversion
+    time, which can widen the spread considerably, so treat this as indicative.
+    """
+    rows = []
+    print(f"{'layer':<16s} {'kind':<10s} {'channels':>9s} {'max|w|':>10s} "
+          f"{'chan spread':>12s} {'worst in-chan':>14s}")
+    for layer in model.layers:
+        kind = layer.__class__.__name__
+        if kind not in ("Conv1D", "DepthwiseConv1D", "Dense"):
+            continue
+        weights = layer.get_weights()
+        if not weights:
+            continue
+        w = np.asarray(weights[0], dtype=np.float64)
+        # Last axis is the output channel for Conv1D/Dense; for DepthwiseConv1D
+        # the channel axis is the second-to-last, so flatten all but that.
+        axis = -2 if kind == "DepthwiseConv1D" else -1
+        w = np.moveaxis(w, axis, 0).reshape(w.shape[axis], -1)
+
+        per_chan_max = np.abs(w).max(axis=1)
+        per_chan_max = np.maximum(per_chan_max, 1e-12)
+        chan_spread = float(per_chan_max.max() / per_chan_max.min())
+
+        # Within a channel: how much of that channel's int8 range the typical
+        # weight uses. Small means the channel is dominated by one large tap.
+        p99 = np.percentile(np.abs(w), 99, axis=1)
+        worst_in_chan = float((127.0 * p99 / per_chan_max).min())
+
+        rows.append({
+            "layer": layer.name, "kind": kind, "channels": int(w.shape[0]),
+            "max_abs": float(np.abs(w).max()), "channel_spread": chan_spread,
+            "worst_in_channel_levels": worst_in_chan,
+        })
+        print(f"{layer.name:<16s} {kind:<10s} {w.shape[0]:>9d} "
+              f"{np.abs(w).max():>10.4f} {chan_spread:>12.1f}x "
+              f"{worst_in_chan:>14.1f}")
+
+    if rows:
+        worst = min(rows, key=lambda r: r["worst_in_channel_levels"])
+        print(f"\nworst in-channel utilization: {worst['layer']} "
+              f"({worst['worst_in_channel_levels']:.1f} of 127 levels)")
+        print("Per-channel quantization handles between-channel spread; it is the "
+              "in-channel figure that costs accuracy.")
     return rows
