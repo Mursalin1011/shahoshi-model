@@ -31,6 +31,7 @@ SRC = REPO / "src" / "shahoshi"
 TRACKED = {
     "augment": SRC / "augment.py",
     "export": SRC / "export.py",
+    "fusion": SRC / "fusion.py",
     "manifest": SRC / "manifest.py",
     "quantize": SRC / "quantize.py",
     "scoring": SRC / "scoring.py",

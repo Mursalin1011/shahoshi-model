@@ -1,0 +1,98 @@
+# Stage 0 training, with the Stage 3 vote spelled out rather than defaulted.
+#
+# Nothing here changes the model: the fusion block only sizes the consensus rule
+# and is exported to firmware. It is a separate config so the two versions of
+# the vote can be compared in one manifest table.
+#
+# Against the defaults, this file raises the sustain from 4 s to 8 s. The plan
+# specifies a 4 s hold and a 4 s sustain, and those two numbers cancel: a fire
+# latches its branch's vote for the whole 4 s hold, so a single coincident pair
+# of fires already satisfies a 4 s sustain and the clause buys nothing beyond
+# the coincidence. `fusion.sustain_margin` reports that as 0.00 s. At 8 s the
+# margin is +4 s, meaning the branches must keep re-firing rather than merely
+# having fired once -- which halves the predicted false-consensus rate (bound
+# 0.119/h to 0.059/h at 6 alarms/hour per branch) at the cost of up to four
+# extra seconds before an alert leaves the device.
+#
+# Whether four seconds of latency is worth that is a product decision, not a
+# modelling one, which is exactly why both settings are written down.
+
+name: movement-fusion
+notes: >
+  Stage 0 baseline model, with an explicit 2-of-3 fusion specification whose
+  sustain sits outside the hold window.
+
+out_dir: artifacts
+report_dir: reports
+
+data:
+  root: data
+  datasets: [uci, ms]
+  win: 128        # 2.56 s at 50 Hz, matching UCI HAR's native windowing
+  stride: 64      # 50% overlap -> a 1.28 s inference hop on device
+  fs: 50
+  download: true
+
+split:
+  protocol: subject
+  seed: 42
+  fracs: [0.70, 0.15, 0.15]
+
+augment:
+  times: 0
+
+model:
+  embed_dim: 64
+  width: 1.0
+  dropout: 0.3
+  bounded_relu: true
+  with_fall_head: false
+
+train:
+  epochs: 120
+  batch_size: 64
+  lr: 0.001
+  patience: 20
+  monitor: val_macro_f1
+  class_weighted: true
+  deterministic: true
+  seed: 42
+
+quantize:
+  n_representative: 512
+  output_int8: true
+  seed: 42
+
+scoring:
+  shrinkage: 0.001
+  target_fars: [0.5, 1.0, 2.0, 6.0]
+  export_far: 1.0
+
+fusion:
+  votes_required: 2.0       # two of three, the proposal's consensus principle
+  sustain_seconds: 8.0      # 4 s longer than the longest hold, so the clause bites
+  cooldown_seconds: 30.0    # an alert is a phone call; one event, one call
+  degraded_policy: strict   # a device that cannot vote says so rather than lowering the bar
+  min_votes_required: 1.0
+  latency_budget_seconds: 10.0
+  target_fused_far: 1.0
+  branches:
+    # far_budget is per branch and deliberately loose: consensus is what makes
+    # the fused rate small. `fusion.budget_per_branch(1.0, ...)` says 25 alarms
+    # per hour each would still meet a 1/h fused bound under this rule; 6/h is
+    # kept as the conservative starting point until real branches exist.
+    - name: movement
+      far_budget: 6.0
+      hold_seconds: 4.0
+      weight: 1.0
+      implemented: true
+    - name: hr
+      far_budget: 6.0
+      hold_seconds: 4.0     # PPG resolves slowly; a spike is not instantaneous
+      weight: 1.0
+      implemented: false
+    - name: audio
+      far_budget: 6.0
+      hold_seconds: 4.0     # an acoustic event is milliseconds; the hold is what
+      weight: 1.0           # lets it coincide with a 1.28 s movement hop at all
+      implemented: false

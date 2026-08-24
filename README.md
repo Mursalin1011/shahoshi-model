@@ -19,6 +19,7 @@ src/shahoshi/
   splits.py     subject-disjoint / LOSO / leave-one-dataset-out
   augment.py    mount-invariance augmentation
   scoring.py    entropy + Mahalanobis novelty, false-alarm calibration
+  fusion.py     2-of-3 consensus engine, its FAR arithmetic, its generated C
   models/       Keras definitions            (needs TensorFlow)
   quantize.py   int8 conversion + inference  (needs TensorFlow)
   export.py     C array, op resolver, runtime config for ESP-IDF
@@ -26,7 +27,7 @@ src/shahoshi/
   manifest.py   per-run provenance
 configs/        experiment configs, one per run
 notebooks/      thin drivers -- logic lives in src/
-tests/          258 tests, none requiring TensorFlow
+tests/          361 tests, none requiring TensorFlow
 artifacts/      generated .tflite / .h / .cc / config  (gitignored)
 reports/        per-run manifests                       (gitignored)
 ```
@@ -76,10 +77,25 @@ number. Phase B adds a fall head and retrains multi-task.
 SNR-controlled urban-noise mixing). Note that ESC-50 and UrbanSound8K contain
 no scream class, contrary to the original proposal.
 
-**Stage 3.** Fusion. No public dataset records movement, HR and audio
-simultaneously during distress, so the 2-of-3 vote stays hand-designed with each
-branch calibrated to its own alarms-per-hour budget. The heart-rate branch does
-not exist yet — the vote currently has one voter.
+**Stage 3 — the vote is built, ahead of two of its voters.** No public dataset
+records movement, HR and audio simultaneously during distress, so the 2-of-3
+vote cannot be learned; it is specified in `fusion.py`, pinned by tests, and
+emitted to the firmware as generated C (`fusion_source`) rather than
+transcribed by hand into a sketch. Each branch is calibrated to its own
+alarms-per-hour budget by `calibrate_branches`; consensus is what makes the
+fused rate small.
+
+The engine latches each fire for a hold window (the branches are asynchronous:
+a 1.28 s movement hop cannot coincide with a millisecond-long acoustic event
+otherwise), requires consensus to persist, and enforces a cooldown so one
+confirmed event sends one alert rather than thirty. Three things it makes
+explicit:
+
+| | |
+|---|---|
+| **The vote has one voter today** | Under the default `strict` degradation policy a 2-of-3 rule with only the movement branch live *cannot fire*. The engine reports `can_alarm = False`, the config prints `fusion UNREACHABLE`, and the generated header carries a `CANNOT RAISE AN ALARM` warning — so a silent field test is not mistaken for a quiet device. |
+| **The plan's 4 s hold and 4 s sustain cancel** | A fire latches its branch for the whole hold, so a single coincident pair already satisfies a 4 s sustain: `sustain_margin` reports 0.00 s. Raising the sustain to 8 s (`configs/movement_fusion.yaml`) is what makes the clause demand repeated agreement. |
+| **The fused false-alarm rate is arithmetic, not a hope** | At 6 alarms/hour per branch the fused bound is 0.12/h and the measured rate (the real engine over Poisson fires) is ~0/h; even at 60/h per branch — one interruption a minute, individually unusable — the fused rate is 0.29/h. Both assume the branches fail independently, and they do not: a struggle drives movement and corrupts the PPG from one physical cause. That correlation is the largest unmeasurable risk in the design. |
 
 ## Two things to keep in view
 

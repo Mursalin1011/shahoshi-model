@@ -8,6 +8,7 @@ windows.py  sliding-window extraction and event-based window labelling
 splits.py   subject-disjoint, leave-one-subject-out, leave-one-dataset-out
 augment.py  mount-invariance augmentation (rotation, scale, jitter, warp)
 scoring.py  entropy / Mahalanobis novelty scoring and false-alarm calibration
+fusion.py   the 2-of-3 consensus engine: latch, sustain, cooldown, degradation
 models/     Keras model definitions            (requires TensorFlow)
 quantize.py int8 conversion and int8 inference (requires TensorFlow)
 export.py   C array + op-resolver + config emission for ESP-IDF

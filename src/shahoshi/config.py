@@ -102,6 +102,161 @@ class ScoringConfig:
 
 
 @dataclass
+class BranchConfig:
+    """One voter in the consensus rule, as configured rather than as calibrated.
+
+    `far_budget` is the knob; `threshold` is what calibration derives from it on
+    the run's own normal data, and is left None here so a stale number copied
+    between configs cannot masquerade as a calibrated one. Set it only to pin a
+    branch that has no scores to calibrate against (a hardware amplitude trip).
+    """
+
+    name: str
+    far_budget: float = 6.0        # alarms per hour for this branch *alone*
+    hold_seconds: float = 4.0      # coincidence window
+    weight: float = 1.0
+    threshold: float | None = None
+    # False for a branch that is specified but not yet built, which is the
+    # normal state of this project: it keeps the rule's arithmetic honest
+    # (a 2-of-3 vote with one implemented branch cannot fire) instead of
+    # letting the config imply three working sensors.
+    implemented: bool = False
+
+
+@dataclass
+class FusionConfig:
+    """The hand-designed 2-of-3 vote. See `shahoshi.fusion` for the semantics."""
+
+    branches: list[BranchConfig] = field(
+        default_factory=lambda: [
+            BranchConfig(name="movement", far_budget=6.0, weight=1.0, implemented=True),
+            BranchConfig(name="hr", far_budget=6.0, weight=1.0),
+            BranchConfig(name="audio", far_budget=6.0, weight=1.0),
+        ]
+    )
+    votes_required: float = 2.0
+    sustain_seconds: float = 4.0
+    cooldown_seconds: float = 30.0
+    degraded_policy: str = "strict"
+    min_votes_required: float = 1.0
+    # An alarm later than this after an event onset is not a rescue; it is the
+    # window `fusion.evaluate` scores event-level recall over.
+    latency_budget_seconds: float = 10.0
+    # Fused budget the per-branch budgets are meant to buy, for reporting
+    # against `fusion.fused_far_upper_bound`.
+    target_fused_far: float = 1.0
+
+    @classmethod
+    def from_raw(cls, raw: dict) -> FusionConfig:
+        raw = dict(raw or {})
+        branches = raw.pop("branches", None)
+        known = {f.name for f in fields(cls)}
+        unknown = set(raw) - known
+        if unknown:
+            raise ValueError(
+                f"unknown key(s) {sorted(unknown)} under 'fusion'; "
+                f"expected {sorted(known)}"
+            )
+        cfg = cls(**raw)
+        if branches is not None:
+            branch_known = {f.name for f in fields(BranchConfig)}
+            parsed = []
+            for entry in branches:
+                bad = set(entry) - branch_known
+                if bad:
+                    raise ValueError(
+                        f"unknown key(s) {sorted(bad)} under a fusion branch; "
+                        f"expected {sorted(branch_known)}"
+                    )
+                parsed.append(BranchConfig(**entry))
+            cfg.branches = parsed
+        return cfg
+
+    @property
+    def total_weight(self) -> float:
+        return float(sum(b.weight for b in self.branches))
+
+    @property
+    def implemented_weight(self) -> float:
+        """Vote weight actually reachable today. Below `votes_required`, the
+        alarm cannot fire on hardware -- which is the current state of Stage 3
+        and should be visible in the config, not discovered on a wrist."""
+        return float(sum(b.weight for b in self.branches if b.implemented))
+
+    def reachability_note(self) -> str:
+        """One line saying whether the configured vote can fire on today's hardware.
+
+        Not a validation error -- a 2-of-3 rule specified before the second and
+        third sensors exist is the correct order to build in. It is a line for
+        the run report, so the gap is read off a manifest rather than inferred
+        from a device that never alarms.
+        """
+        built = [b.name for b in self.branches if b.implemented]
+        pending = [b.name for b in self.branches if not b.implemented]
+        if self.implemented_weight >= self.votes_required - 1e-9:
+            return (
+                f"fusion reachable: {self.implemented_weight:g} of "
+                f"{self.votes_required:g} required vote weight is implemented "
+                f"({', '.join(built)})"
+            )
+        return (
+            f"fusion UNREACHABLE on hardware: implemented branches "
+            f"{built or ['none']} carry {self.implemented_weight:g} weight against "
+            f"{self.votes_required:g} required. Pending: {pending or ['none']}. "
+            f"Under the 'strict' policy the alarm cannot fire, and a zero "
+            f"false-alarm rate from this configuration means nothing."
+        )
+
+    def validate(self, hop_seconds: float) -> None:
+        if not self.branches:
+            raise ValueError("fusion needs at least one branch")
+        names = [b.name for b in self.branches]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(f"duplicate fusion branch name(s) {dupes}")
+        if self.degraded_policy not in ("strict", "proportional"):
+            raise ValueError(
+                f"fusion.degraded_policy must be 'strict' or 'proportional'; "
+                f"got {self.degraded_policy!r}"
+            )
+        if self.votes_required <= 0:
+            raise ValueError("fusion.votes_required must be positive")
+        if self.votes_required > self.total_weight + 1e-9:
+            raise ValueError(
+                f"fusion.votes_required ({self.votes_required}) exceeds the total "
+                f"branch weight ({self.total_weight}): no combination of votes can "
+                f"reach it, so the alarm is unreachable by construction"
+            )
+        for b in self.branches:
+            if b.weight <= 0:
+                raise ValueError(f"fusion branch {b.name!r}: weight must be positive")
+            if b.hold_seconds <= 0:
+                raise ValueError(
+                    f"fusion branch {b.name!r}: hold_seconds must be positive, else "
+                    f"two asynchronous branches can never overlap"
+                )
+            if b.far_budget < 0:
+                raise ValueError(f"fusion branch {b.name!r}: far_budget must be >= 0")
+        if self.sustain_seconds < 0:
+            raise ValueError("fusion.sustain_seconds must be non-negative")
+        if 0 < self.sustain_seconds < hop_seconds:
+            raise ValueError(
+                f"fusion.sustain_seconds ({self.sustain_seconds}) is shorter than one "
+                f"inference hop ({hop_seconds:.2f} s), so a single consenting tick "
+                f"alarms and the sustain requirement does nothing. Set it to 0 to "
+                f"disable sustain deliberately, or to a multiple of the hop."
+            )
+        if self.cooldown_seconds < 0:
+            raise ValueError("fusion.cooldown_seconds must be non-negative")
+        if self.min_votes_required <= 0:
+            raise ValueError("fusion.min_votes_required must be positive")
+        if self.latency_budget_seconds <= 0:
+            raise ValueError("fusion.latency_budget_seconds must be positive")
+        if self.target_fused_far <= 0:
+            raise ValueError("fusion.target_fused_far must be positive")
+
+
+@dataclass
 class Config:
     name: str = "movement-baseline"
     notes: str = ""
@@ -114,6 +269,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     quantize: QuantizeConfig = field(default_factory=QuantizeConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    fusion: FusionConfig = field(default_factory=FusionConfig)
 
     # -- io -------------------------------------------------------------------
 
@@ -152,7 +308,11 @@ class Config:
                 f"unknown config key(s) {sorted(unknown)}; expected {sorted(known)}"
             )
         for key, value in raw.items():
-            if key in sub_types:
+            if key == "fusion":
+                # Its `branches` entry is a list of dataclasses, so it parses
+                # itself rather than through the flat **value path below.
+                kwargs[key] = FusionConfig.from_raw(value or {})
+            elif key in sub_types:
                 sub_known = {f.name for f in fields(sub_types[key])}
                 sub_unknown = set(value or {}) - sub_known
                 if sub_unknown:
@@ -211,3 +371,4 @@ class Config:
             )
         if self.scoring.export_far <= 0:
             raise ValueError("scoring.export_far must be positive")
+        self.fusion.validate(self.data.hop_seconds)
