@@ -33,6 +33,7 @@ URLS = [
 ]
 
 MARKER = "train/y_train.txt"
+SUBDIR = "uci_har"
 
 # UCI activity id -> our label. 6 (LAYING) is deliberately absent.
 LABEL_MAP = {
@@ -56,15 +57,15 @@ def download(data_dir: str | Path) -> Path:
 
     # The UCI archive nests a second zip inside the first on some mirrors.
     fetch(URLS, zip_path, min_mb=50)
-    extract(zip_path, data_dir / "uci_har", expect=None)
+    extract(zip_path, data_dir / SUBDIR, expect=None)
     try:
-        return find_root(data_dir / "uci_har", MARKER)
+        return find_root(data_dir / SUBDIR, MARKER)
     except FileNotFoundError:
-        inner = list((data_dir / "uci_har").rglob("UCI HAR Dataset.zip"))
+        inner = list((data_dir / SUBDIR).rglob("UCI HAR Dataset.zip"))
         if not inner:
             raise
-        extract(inner[0], data_dir / "uci_har")
-        return find_root(data_dir / "uci_har", MARKER)
+        extract(inner[0], data_dir / SUBDIR)
+        return find_root(data_dir / SUBDIR, MARKER)
 
 
 def load(root: str | Path) -> WindowSet:

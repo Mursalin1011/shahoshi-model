@@ -29,6 +29,7 @@ FS = 50
 
 URLS = ["https://github.com/mmalekzadeh/motion-sense/raw/master/data/A_DeviceMotion_data.zip"]
 MARKER = "wlk_15"
+SUBDIR = "motionsense"
 
 # Folder-name prefix -> our label. MotionSense has no 'lay' trials at all, so
 # unlike UCI nothing is dropped here.
@@ -59,8 +60,8 @@ def download(data_dir: str | Path) -> Path:
     data_dir = Path(data_dir)
     zip_path = data_dir / "motionsense.zip"
     fetch(URLS, zip_path, min_mb=50)
-    extract(zip_path, data_dir / "motionsense", expect=None)
-    return find_root(data_dir / "motionsense", MARKER)
+    extract(zip_path, data_dir / SUBDIR, expect=None)
+    return find_root(data_dir / SUBDIR, MARKER)
 
 
 def load(root: str | Path, win: int = 128, stride: int = 64) -> WindowSet:

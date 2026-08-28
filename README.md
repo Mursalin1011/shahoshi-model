@@ -108,6 +108,24 @@ explicit:
 | **The plan's 4 s hold and 4 s sustain cancel** | A fire latches its branch for the whole hold, so a single coincident pair already satisfies a 4 s sustain: `sustain_margin` reports 0.00 s. Raising the sustain to 8 s (`configs/movement_fusion.yaml`) is what makes the clause demand repeated agreement. |
 | **The fused false-alarm rate is arithmetic, not a hope** | At 6 alarms/hour per branch the fused bound is 0.12/h and the measured rate (the real engine over Poisson fires) is ~0/h; even at 60/h per branch — one interruption a minute, individually unusable — the fused rate is 0.29/h. Both assume the branches fail independently, and they do not: a struggle drives movement and corrupts the PPG from one physical cause. That correlation is the largest unmeasurable risk in the design. |
 
+**Heart-rate branch — corpora loaded and audited, no model.** WESAD (the
+positives: 15 subjects, Empatica E4 on the wrist, a public-speaking stressor)
+and PPG-DaLiA (the negatives, and the denominator that alarms-per-hour is quoted
+against) load through `datasets.load_hr` into an `HRWindowSet` — a sibling of
+`WindowSet`, not a widening of it, because a 4-channel PPG stack has no business
+passing a 6-channel IMU assertion. Both are resampled to **100 Hz, the
+MAX30102's rate**, so `hr.py` will be written at the rate it runs at. WESAD's
+700 Hz chest ECG is reduced to per-beat ground truth that every window is scored
+against; it is truth only, never a model input.
+
+Nothing is trained. `datasets.availability` counts what is actually there first
+and **raises** — on zero positives, on positives confined to one subject, on an
+accelerometer left in the E4's 1/64 g units. That gate exists because the
+companion repository shipped a four-class model whose `gunshot` class contained
+zero samples: the defect was not the missing data, it was that nothing counted
+before training consumed it. Run `notebooks/03_hr.ipynb` and it reports on
+PPG-DaLiA alone that there is nothing to detect, which is the gate working.
+
 ## Two things to keep in view
 
 **Every corpus is waist- or pocket-mounted; the device is worn on the wrist.**

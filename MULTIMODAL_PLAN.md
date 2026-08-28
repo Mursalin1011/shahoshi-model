@@ -2,7 +2,8 @@
 
 Working document. Written 2026-08-28, before any code was changed, so that the
 reasoning behind the next stages survives without the conversation that produced
-it. **A1 landed 2026-08-29** (§9); nothing else here is implemented yet.
+it. **A1 and B have landed** (§9, §12). Everything else here is still
+unimplemented.
 
 The short version: Stage 3 built the 2-of-3 vote ahead of two of its three
 voters. This plan builds those two voters. Along the way it corrects the target
@@ -380,7 +381,7 @@ Each stage lands independently.
 |---|---|---|
 | **A0** | Bench diagnostic: sound module analog or digital; MAX30102 raw FIFO read at 100 sps on a wrist | Half a day, and it decides Plan A vs Plan B before code is written |
 | **A1 — done** | Hardware claims corrected in `README.md`, `export.py`, `models/movement.py`, `notebooks/01_movement.ipynb` and `tests/test_export.py`. Two deliberate deviations from this row: (a) the ESP-NN framing was replaced rather than retargeted — `NOT_ESP_NN_ACCELERATED` is now `DATA_MOVEMENT_OPS`, and the report key `not_accelerated` is now `data_movement`, because on an LX6 *nothing* is accelerated, so a name meaning "lacks a vectorized path" distinguished none of the seven ops, whereas "computes nothing, only moves memory" is true of all seven on any MCU; (b) esp-dsp is named in the README's Stage 2 rather than in `firmware_notes`, being the audio branch's FFT and irrelevant to the movement model's deployment checklist | The repo no longer prints firmware advice that does nothing on this part. A new test, `test_does_not_advise_enabling_esp_nn`, pins the correction so it cannot silently return |
-| **B** | `datasets/wesad.py`, `datasets/dalia.py`, loaders and tests, behind an availability gate | The HR corpora load and contain what is assumed |
+| **B — done** | `datasets/wesad.py` and `datasets/dalia.py`, plus four modules this row did not anticipate: `e4.py` (shared Empatica parsing), `ecg.py` (R-peak reduction, because WESAD ships a 700 Hz ECG but no HR track), `cache.py` (a versioned distilled cache, so an 18 GB archive is parsed once) and `availability.py` (the gate itself). 78 tests; `notebooks/03_hr.ipynb` drives it | The HR corpora load, and the gate raises rather than prints when they do not contain what is assumed |
 | **C** | `hr.py` plus a **frozen, untrained** deviation rule scored against WESAD stress and DaLiA negatives, as recall-at-FAR | Whether a statistic already captures most of the separation. If it does, do not train a model — the same lesson as the dropped `lay` class |
 | **D** | Audio, per the A0 fork | The first honest audio number, or an honest admission there is not one |
 | **E** | **Correlation measurement.** Compute the movement score and the HR score on the *same* WESAD windows and measure their dependence | The headline. `fused_far_upper_bound` assumes branch independence, which the README names as the largest unmeasurable risk in the design. WESAD makes it measurable |
@@ -416,7 +417,7 @@ files later, and the scaffolding is already written.
 |---|---|---|
 | 1 | Sound module: analog or digital? | **Blocking for Stage D.** No default |
 | 2 | Is the hardware in hand? Decides whether the sensor-simulation step can use a measured noise floor | Assume not; defer that calibration |
-| 3 | Colab tier and Drive space — decides whether a caching layer is worth writing | Assume free tier; write the subset downloader |
+| 3 | ~~Colab tier and Drive space~~ | **Answered 2026-08-29**: free tier, ample Drive. `cache.py` distils each subject to a few MB and persists it to Drive, so the 18 GB WESAD download happens once rather than per session |
 | 4 | Kaggle credentials for SisFall | Not needed until Stage 1 is scoped in |
 | 5 | Own data collection (Implementation Plan §2: 30–50 volunteers, ethics approval)? It is the only path to a synchronized triad and therefore to validating the vote | Assume no; state the limitation in the README |
 | 6 | Merge `stage3-fusion-engine` into `main` before building on it? | Branch from `stage3-fusion-engine`; leave the merge as a separate decision |
@@ -427,5 +428,6 @@ files later, and the scaffolding is already written.
 ## 12. Immediate next actions
 
 1. ~~**A1** — the hardware corrections in §9.~~ Done 2026-08-29.
-2. **A0** — the bench diagnostic, which unblocks Stage D. Now the critical path: it needs the physical board, and decision 1 has no default.
-3. **B** — the WESAD and DaLiA loaders, gated only on decision 3.
+2. ~~**B** — the WESAD and DaLiA loaders.~~ Done 2026-08-29. Decision 3 answered: free Colab tier, ample Drive.
+3. **A0** — the bench diagnostic. Now the critical path for the audio branch: it needs the physical board, and decision 1 has no default.
+4. **C** — `hr.py` and the frozen deviation rule, scored against the corpora B now loads. Unblocked.
