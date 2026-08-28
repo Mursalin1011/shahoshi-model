@@ -52,14 +52,19 @@ class TestCheckOps:
     def test_flags_nothing_for_the_clean_model(self):
         report = check_ops(CLEAN_OPS)
         assert report["unmapped"] == []
-        assert report["not_accelerated"] == []
+        assert report["data_movement"] == []
 
-    def test_flags_the_dilation_ops_as_unaccelerated(self):
-        """The reason Stage 0 dropped dilated convolutions: ESP-NN has no int8
-        kernel for the space-to-batch pair, so they run as reference C++ while
-        the convolutions around them are vectorized."""
+    def test_flags_the_dilation_ops_as_data_movement(self):
+        """The reason Stage 0 dropped dilated convolutions: the space-to-batch
+        pair computes nothing. It only rearranges memory, costing a copy over
+        the whole tensor plus a scratch buffer in the arena.
+
+        The reason used to be stated as ESP-NN having no int8 kernel for the
+        pair. The target is a plain ESP32 (LX6), where no operator is
+        SIMD-accelerated, so that reason distinguished nothing; the one above
+        holds on any MCU."""
         report = check_ops(BASELINE_OPS)
-        assert set(report["not_accelerated"]) == {"SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"}
+        assert set(report["data_movement"]) == {"SPACE_TO_BATCH_ND", "BATCH_TO_SPACE_ND"}
 
     def test_reports_unmapped_without_raising(self):
         report = check_ops(["CONV_2D", "SOME_NEW_OP"])
@@ -96,8 +101,8 @@ class TestResolverSource:
     def test_does_not_register_the_host_only_delegate(self):
         assert "Delegate" not in resolver_source(BASELINE_OPS)
 
-    def test_warns_about_unaccelerated_ops(self):
-        assert "no ESP-NN int8 kernel" in resolver_source(BASELINE_OPS)
+    def test_warns_about_data_movement_ops(self):
+        assert "only rearrange memory" in resolver_source(BASELINE_OPS)
 
     def test_no_warning_for_the_clean_model(self):
         assert "WARNING" not in resolver_source(CLEAN_OPS)
@@ -212,7 +217,7 @@ class TestNormalizationSource:
 
 
 class TestFirmwareNotes:
-    def test_mentions_sizes_and_esp_nn(self):
+    def test_mentions_sizes_and_the_target_part(self):
         text = firmware_notes(
             CLEAN_OPS,
             {"flash_kb": 40.0, "largest_tensor_kb": 4.0, "sum_of_tensors_kb": 60.0},
@@ -220,13 +225,26 @@ class TestFirmwareNotes:
         )
         assert "40.0 KB" in text
         assert "arena_used_bytes()" in text
-        assert "CONFIG_NN_OPTIMIZATIONS=y" in text
+        assert "LX6" in text
 
-    def test_warns_when_ops_are_unaccelerated(self):
+    def test_does_not_advise_enabling_esp_nn(self):
+        """Pins the correction. The checklist used to tell the reader to set
+        CONFIG_NN_OPTIMIZATIONS=y on an ESP32-S3. The confirmed part is a plain
+        ESP32 (LX6), where ESP-NN falls back to generic C, so that advice moved
+        a reader toward a wrong benchmark and a part nobody is buying."""
+        text = firmware_notes(
+            CLEAN_OPS,
+            {"flash_kb": 40.0, "largest_tensor_kb": 4.0, "sum_of_tensors_kb": 60.0},
+            "movement_config.json",
+        )
+        assert "CONFIG_NN_OPTIMIZATIONS=y" not in text
+        assert "time a real Invoke()" in text
+
+    def test_warns_when_ops_are_data_movement(self):
         text = firmware_notes(
             BASELINE_OPS,
             {"flash_kb": 46.8, "largest_tensor_kb": 4.0, "sum_of_tensors_kb": 60.0},
             "movement_config.json",
         )
-        assert "no ESP-NN int8 kernel" in text
+        assert "only rearrange memory" in text
         assert "SPACE_TO_BATCH_ND" in text

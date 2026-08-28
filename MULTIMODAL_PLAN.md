@@ -2,7 +2,7 @@
 
 Working document. Written 2026-08-28, before any code was changed, so that the
 reasoning behind the next stages survives without the conversation that produced
-it. Nothing in this file has been implemented yet.
+it. **A1 landed 2026-08-29** (§9); nothing else here is implemented yet.
 
 The short version: Stage 3 built the 2-of-3 vote ahead of two of its three
 voters. This plan builds those two voters. Along the way it corrects the target
@@ -379,7 +379,7 @@ Each stage lands independently.
 | # | Work | What it settles |
 |---|---|---|
 | **A0** | Bench diagnostic: sound module analog or digital; MAX30102 raw FIFO read at 100 sps on a wrist | Half a day, and it decides Plan A vs Plan B before code is written |
-| **A1** | Correct the hardware claims in `README.md:7-8,76`, `export.py:63-64,124,226,235`, `models/movement.py:8-13`, and the 4 stale assertions in `tests/test_export.py`; rewrite `firmware_notes` for LX6 + esp-dsp | The repo currently prints firmware advice that does nothing on this part. Unblocked by everything else |
+| **A1 — done** | Hardware claims corrected in `README.md`, `export.py`, `models/movement.py`, `notebooks/01_movement.ipynb` and `tests/test_export.py`. Two deliberate deviations from this row: (a) the ESP-NN framing was replaced rather than retargeted — `NOT_ESP_NN_ACCELERATED` is now `DATA_MOVEMENT_OPS`, and the report key `not_accelerated` is now `data_movement`, because on an LX6 *nothing* is accelerated, so a name meaning "lacks a vectorized path" distinguished none of the seven ops, whereas "computes nothing, only moves memory" is true of all seven on any MCU; (b) esp-dsp is named in the README's Stage 2 rather than in `firmware_notes`, being the audio branch's FFT and irrelevant to the movement model's deployment checklist | The repo no longer prints firmware advice that does nothing on this part. A new test, `test_does_not_advise_enabling_esp_nn`, pins the correction so it cannot silently return |
 | **B** | `datasets/wesad.py`, `datasets/dalia.py`, loaders and tests, behind an availability gate | The HR corpora load and contain what is assumed |
 | **C** | `hr.py` plus a **frozen, untrained** deviation rule scored against WESAD stress and DaLiA negatives, as recall-at-FAR | Whether a statistic already captures most of the separation. If it does, do not train a model — the same lesson as the dropped `lay` class |
 | **D** | Audio, per the A0 fork | The first honest audio number, or an honest admission there is not one |
@@ -426,6 +426,6 @@ files later, and the scaffolding is already written.
 
 ## 12. Immediate next actions
 
-1. **A1** — the hardware corrections in §9. Self-contained, unblocked by every open question above, one commit.
-2. **A0** — the bench diagnostic, which unblocks Stage D.
+1. ~~**A1** — the hardware corrections in §9.~~ Done 2026-08-29.
+2. **A0** — the bench diagnostic, which unblocks Stage D. Now the critical path: it needs the physical board, and decision 1 has no default.
 3. **B** — the WESAD and DaLiA loaders, gated only on decision 3.

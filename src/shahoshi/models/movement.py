@@ -5,12 +5,12 @@ Two deliberate departures from the pre-refactor notebook.
 **No dilated convolutions.** Dilation gave a wide receptive field cheaply, but
 TFLite lowers a dilated depthwise convolution into
 ``SPACE_TO_BATCH_ND -> DEPTHWISE_CONV_2D -> BATCH_TO_SPACE_ND``. Those two extra
-ops have to be registered in the firmware's resolver, and ESP-NN has no
-optimized int8 kernel for them, so on an ESP32-S3 they run as plain reference
-C++ while the convolutions around them are vectorized. Replacing dilation with
-one more stride-2 pooling stage buys the same global context -- global average
-pooling sees the whole sequence regardless -- with an op set that is entirely
-ESP-NN accelerated. `shahoshi.export.resolver_source` generates the resolver
+ops have to be registered in the firmware's resolver, and both of them compute
+nothing: they only rearrange memory, at the cost of a copy over the whole
+tensor plus a scratch buffer in an arena that is already the scarce resource.
+Replacing dilation with one more stride-2 pooling stage buys the same global
+context -- global average pooling sees the whole sequence regardless -- with an
+op set that is all arithmetic. `shahoshi.export.resolver_source` generates the resolver
 from the converted model's actual op list, so this can never drift out of sync
 with the firmware again.
 

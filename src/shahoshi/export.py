@@ -60,10 +60,19 @@ RESOLVER_METHODS: dict[str, str] = {
 # dump and would have sent someone hunting for AddDelegate().
 HOST_ONLY_OPS = {"DELEGATE"}
 
-# Ops that ESP-NN has no optimized int8 kernel for. They still run, as reference
-# C++, which on an ESP32-S3 is several times slower than the vectorized path --
-# so a model that leans on them wastes the reason for choosing the S3.
-NOT_ESP_NN_ACCELERATED = {
+# Ops that compute nothing: they only rearrange memory. Each costs a copy loop
+# over the whole tensor and, in most cases, a scratch buffer in the arena -- so
+# a model that leans on them spends its budget on layout rather than on
+# arithmetic.
+#
+# This set used to be named for what ESP-NN has no int8 kernel for, which was
+# advice for a part this project is not building on. The target is a plain
+# ESP32 (Xtensa LX6); ESP-NN's optimized kernels are hand-written for the S3's
+# SIMD unit and fall back to generic C on the LX6, so *every* operator here
+# runs as reference C++ and singling these out for lacking a vectorized path
+# says nothing. They are still worth flagging, for a reason that holds on any
+# MCU: pure data movement.
+DATA_MOVEMENT_OPS = {
     "SPACE_TO_BATCH_ND",
     "BATCH_TO_SPACE_ND",
     "TRANSPOSE",
@@ -80,7 +89,7 @@ def device_ops(ops: list[str]) -> list[str]:
 
 
 def check_ops(ops: list[str]) -> dict[str, list[str]]:
-    """Report unmapped and un-accelerated operators without raising.
+    """Report unmapped and data-movement operators without raising.
 
     Call this before `resolver_source` in a notebook so the diagnosis is visible
     rather than arriving as an exception.
@@ -89,7 +98,7 @@ def check_ops(ops: list[str]) -> dict[str, list[str]]:
     return {
         "ops": real,
         "unmapped": [o for o in real if o not in RESOLVER_METHODS],
-        "not_accelerated": [o for o in real if o in NOT_ESP_NN_ACCELERATED],
+        "data_movement": [o for o in real if o in DATA_MOVEMENT_OPS],
     }
 
 
@@ -117,13 +126,13 @@ def resolver_source(ops: list[str], var: str = "resolver") -> str:
     ]
     lines += [f"{var}.{RESOLVER_METHODS[o]}();" for o in real]
 
-    slow = [o for o in real if o in NOT_ESP_NN_ACCELERATED]
-    if slow:
+    layout = [o for o in real if o in DATA_MOVEMENT_OPS]
+    if layout:
         lines.append("")
         lines.append(
-            "// WARNING: no ESP-NN int8 kernel for "
-            + ", ".join(slow)
-            + " -- these run as reference C++."
+            "// WARNING: these operators only rearrange memory: "
+            + ", ".join(layout)
+            + " -- cycles and arena spent on layout, not arithmetic."
         )
     return "\n".join(lines)
 
@@ -223,16 +232,19 @@ def firmware_notes(ops: list[str], arena: dict[str, float], config_name: str) ->
         "",
         "  1. Start the arena at 100 KB, log interp.arena_used_bytes() after the",
         "     first Invoke(), then shrink the arena to that figure times ~1.1.",
-        "  2. On the ESP32-S3 enable ESP-NN (CONFIG_NN_OPTIMIZATIONS=y) for 3-8x",
-        "     faster int8 convolutions; the S3's vector unit is the reason to",
-        "     prefer it over a plain ESP32 or a C3 for this workload.",
+        "  2. The target is a plain ESP32 (Xtensa LX6), not an S3. ESP-NN's",
+        "     optimized int8 kernels are written for the S3's SIMD unit and fall",
+        "     back to generic C here, so CONFIG_NN_OPTIMIZATIONS buys nothing --",
+        "     time a real Invoke() rather than scaling an S3 benchmark.",
         f"  3. Normalization constants and thresholds live in {config_name}.",
         "  4. idf.py add-dependency \"espressif/esp-tflite-micro\"",
     ]
-    if report["not_accelerated"]:
+    if report["data_movement"]:
         lines += [
             "",
-            "  WARNING: these operators have no ESP-NN int8 kernel and will run as",
-            "  reference C++: " + ", ".join(report["not_accelerated"]),
+            "  WARNING: these operators compute nothing and only rearrange memory:",
+            "  " + ", ".join(report["data_movement"]) + ".",
+            "  On a part with no SIMD path that is pure overhead -- cycles, plus",
+            "  arena for the scratch buffer. Prefer a shape that avoids them.",
         ]
     return "\n".join(lines)

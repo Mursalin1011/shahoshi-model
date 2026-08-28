@@ -4,8 +4,13 @@ Multimodal edge-ML threat detection for a wrist-worn personal-safety wearable.
 Inference runs entirely on device; a confirmed event sounds a local alarm and
 sends a WhatsApp alert with a GPS fix.
 
-Target hardware: **ESP32-S3** (vector unit + ESP-NN for int8 acceleration),
-MPU-6050 IMU, MAX30100 PPG, INMP441 I2S microphone, NEO-6M GPS.
+Target hardware: **ESP32** DevKit (Xtensa LX6), MPU-6050 IMU, MAX30102 PPG,
+3-pin sound detection module, NEO-M8N GPS. This part has no SIMD int8 path --
+ESP-NN's optimized kernels are written for the S3 -- so the model is budgeted
+for reference-C++ speed rather than for a vectorized one. Every other document
+in this project states a different device list; `MULTIMODAL_PLAN.md` section 2
+tabulates the disagreement and records the bill of materials above as ground
+truth.
 
 ---
 
@@ -66,16 +71,22 @@ kept at the repo root for reference) are fixed here:
 |---|---|
 | `class_weight=` reweights train loss but not val loss, so `val_loss` was incomparable and `EarlyStopping` restored the **epoch-5** weights | class weighting inside the loss; early stopping on val macro-F1 |
 | `lay` scored 0.25 recall float / 0.09 int8 — gravity is removed, so posture is unrecoverable | class dropped, documented |
-| dilated depthwise convs lower to `SPACE_TO_BATCH_ND`/`BATCH_TO_SPACE_ND`, which ESP-NN cannot accelerate, and the firmware sketch registered 8 ops for a 13-op model — `AllocateTensors()` would have failed | dilation replaced with a stride-2 stage; resolver generated from the converted model's own op list |
+| dilated depthwise convs lower to `SPACE_TO_BATCH_ND`/`BATCH_TO_SPACE_ND`, which compute nothing and only shuffle memory, and the firmware sketch registered 8 ops for a 13-op model — `AllocateTensors()` would have failed | dilation replaced with a stride-2 stage; resolver generated from the converted model's own op list |
 | two `.tflite` files held a byte-identical copy of the same trunk (~45 KB wasted flash, two arenas) | one model, two outputs |
 
 **Stage 1 — next.** SisFall. Phase A scores the frozen Stage 0 model against
 real labelled falls, giving the project its first honest threat-detection
 number. Phase B adds a fall head and retrains multi-task.
 
-**Stage 2.** Acoustic branch (INMP441, log-mel, AudioSet positives with
-SNR-controlled urban-noise mixing). Note that ESC-50 and UrbanSound8K contain
-no scream class, contrary to the original proposal.
+**Stage 2.** Acoustic branch. The confirmed BOM carries a 3-pin sound
+detection module, not the INMP441 previously assumed here, and whether that
+module outputs an analog envelope or a comparator bit decides the whole branch:
+either an ~8 kHz ADC feed with band-energy features and a tiny dense
+classifier, or a 1-bit amplitude trip carrying a weight well below 1.0. A
+log-mel CNN was never the right shape for this part; `esp-dsp` supplies the
+LX6-optimized FFT if the analog path is confirmed. `MULTIMODAL_PLAN.md`
+section 7 states the fork and the bench test that settles it. Note that ESC-50
+and UrbanSound8K contain no scream class, contrary to the original proposal.
 
 **Stage 3 — the vote is built, ahead of two of its voters.** No public dataset
 records movement, HR and audio simultaneously during distress, so the 2-of-3
